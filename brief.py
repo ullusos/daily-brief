@@ -303,24 +303,29 @@ def summarize(sections):
             continue
         merged = []
         for idx, entry in enumerate(new[:ITEMS_PER_SECTION]):
-            original = items[idx] if idx < len(items) else {}
+            fallback = items[idx] if idx < len(items) else {}
+            source = _match_item(entry.get("title", ""), items) or fallback
             merged.append({
-                "title": entry.get("title", original.get("title", "")),
+                "title": entry.get("title") or source.get("title", ""),
                 "summary": entry.get("line", ""),
-                "url": _match_url(entry.get("title", ""), items) or original.get("url", ""),
+                "url": source.get("url", ""),
+                "image": source.get("image"),
             })
         out[name] = merged
     return out
 
 
-def _match_url(title, items):
-    """Best-effort: link a rewritten headline back to its source article."""
+def _match_item(title, items):
+    """
+    Best-effort: match a rewritten headline back to the article it came from,
+    so we keep the original link and thumbnail.
+    """
     words = {w for w in title.lower().split() if len(w) > 4}
     best, score = None, 0
     for i in items:
         overlap = len(words & {w for w in i["title"].lower().split() if len(w) > 4})
         if overlap > score:
-            best, score = i["url"], overlap
+            best, score = i, overlap
     return best
 
 
@@ -328,76 +333,177 @@ def _match_url(title, items):
 
 
 CSS = """
-:root{color-scheme:light dark}
-*{box-sizing:border-box}
-body{margin:0;padding:24px 20px 48px;font:16px/1.5 -apple-system,BlinkMacSystemFont,
-"Segoe UI",system-ui,sans-serif;max-width:560px;margin-inline:auto;
-background:#fbfbfa;color:#1a1a18}
-h1{font-size:20px;margin:0 0 2px;letter-spacing:-.01em}
-.meta{font-size:13px;color:#77776f;margin:0 0 24px}
-h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#77776f;
-margin:28px 0 10px;font-weight:600}
-.card{background:#fff;border:1px solid #e8e8e3;border-radius:12px;padding:14px 16px}
-.temp{font-size:30px;font-weight:600;letter-spacing:-.02em}
-.cond{font-size:15px;margin-left:10px}
-.wdetail{font-size:13px;color:#77776f;margin-top:8px}
-ul{list-style:none;margin:0;padding:0}
-li{padding:11px 0;border-bottom:1px solid #eeeee8}
-li:first-child{padding-top:0}
-li:last-child{border-bottom:none;padding-bottom:0}
-.t{font-weight:600;display:block;margin-bottom:2px}
-.d{font-size:14px;color:#5a5a54}
-a{color:#1a5fb4;text-decoration:none}
-footer{margin-top:32px;font-size:12px;color:#9a9a92;text-align:center}
+:root{
+  color-scheme:light dark;
+  --bg:#f4f4f1; --fg:#17171a; --dim:#6e6e78; --card:#fff;
+  --line:#e6e6e0; --shadow:0 1px 3px rgba(0,0,0,.05),0 8px 24px rgba(0,0,0,.04);
+}
 @media(prefers-color-scheme:dark){
-body{background:#16161a;color:#e8e8e6}
-.card{background:#1f1f24;border-color:#2e2e35}
-li{border-color:#2a2a31}
-.d{color:#9a9aa2}
-a{color:#8ab4f8}
+  :root{--bg:#101014; --fg:#ececef; --dim:#8e8e9a; --card:#1a1a20;
+        --line:#2a2a33; --shadow:0 1px 3px rgba(0,0,0,.4);}
+}
+*{box-sizing:border-box}
+body{margin:0;padding:0 20px 64px;background:var(--bg);color:var(--fg);
+  font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1240px;margin-inline:auto}
+
+/* ---- masthead ---- */
+header{padding:36px 0 22px}
+h1{font-size:clamp(28px,4vw,40px);line-height:1.05;margin:0;
+  letter-spacing:-.03em;font-weight:700}
+.date{font-size:14px;color:var(--dim);margin:6px 0 0;
+  text-transform:uppercase;letter-spacing:.09em;font-weight:600}
+
+/* ---- weather hero ---- */
+.hero{border-radius:20px;padding:26px 28px;color:#fff;margin-bottom:32px;
+  display:flex;align-items:center;gap:24px;flex-wrap:wrap;
+  box-shadow:var(--shadow)}
+.hero-emoji{font-size:clamp(52px,7vw,76px);line-height:1;
+  filter:drop-shadow(0 2px 6px rgba(0,0,0,.25))}
+.hero-main{flex:1 1 220px}
+.hero-temp{font-size:clamp(44px,6vw,62px);font-weight:700;letter-spacing:-.04em;
+  line-height:1}
+.hero-cond{font-size:19px;font-weight:600;opacity:.95;margin-top:2px}
+.hero-stats{display:flex;gap:26px;flex-wrap:wrap;
+  border-left:1px solid rgba(255,255,255,.28);padding-left:26px}
+.stat-v{font-size:20px;font-weight:700;letter-spacing:-.01em}
+.stat-l{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+  opacity:.8;margin-top:2px}
+@media(max-width:640px){
+  .hero-stats{border-left:none;padding-left:0;gap:20px;
+    border-top:1px solid rgba(255,255,255,.28);padding-top:14px;flex-basis:100%}
+}
+
+/* ---- section grid: wide on desktop, single column on phone ---- */
+.grid{display:grid;gap:22px;
+  grid-template-columns:repeat(auto-fit,minmax(330px,1fr));
+  align-items:start}
+.sec{background:var(--card);border:1px solid var(--line);border-radius:18px;
+  padding:20px 22px 8px;box-shadow:var(--shadow)}
+.sec h2{display:flex;align-items:center;gap:9px;margin:0 0 14px;
+  font-size:12px;text-transform:uppercase;letter-spacing:.11em;font-weight:700}
+.dot{width:9px;height:9px;border-radius:50%;flex:none}
+.sec-emoji{font-size:16px}
+
+ol{list-style:none;margin:0;padding:0;counter-reset:n}
+li{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line)}
+li:first-child{border-top:none;padding-top:2px}
+.rank{counter-increment:n;font-size:12px;font-weight:700;color:var(--dim);
+  min-width:15px;padding-top:2px;font-variant-numeric:tabular-nums}
+.rank::before{content:counter(n)}
+.body{flex:1;min-width:0}
+.t{font-size:16px;font-weight:650;letter-spacing:-.01em;display:block;
+  line-height:1.32}
+.d{font-size:14px;color:var(--dim);margin-top:4px;line-height:1.45}
+.thumb{width:74px;height:74px;border-radius:11px;object-fit:cover;flex:none;
+  background:var(--line)}
+li.lead{display:block}
+li.lead .lead-img{width:100%;height:172px;object-fit:cover;border-radius:12px;
+  margin-bottom:11px;background:var(--line);display:block}
+li.lead .t{font-size:19px;line-height:1.25}
+a{color:inherit;text-decoration:none}
+a:hover .t{text-decoration:underline;text-underline-offset:2px}
+
+footer{margin-top:40px;text-align:center;font-size:12px;color:var(--dim)}
+
+/* On phones, stop stretching edge to edge and centre a readable column. */
+@media(max-width:700px){
+  body{padding:0 16px 48px}
+  .wrap{max-width:580px}
+  .grid{grid-template-columns:1fr;gap:18px}
+  .hero{padding:22px}
 }
 """
 
 
 def render_html(weather, sections, today):
     esc = html.escape
+    tint = hero_tint(weather["code"]) if weather else HERO_TINT["cloud"]
+    icon = weather["emoji"] if weather else "📰"
+
     p = [
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
         "<meta name='apple-mobile-web-app-capable' content='yes'>",
         "<meta name='apple-mobile-web-app-title' content='Brief'>",
+        f"<meta name='theme-color' content='{tint[1]}'>",
+        # Emoji favicon, so the browser tab and bookmark aren't a blank page.
+        "<link rel='icon' href=\"data:image/svg+xml,"
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'>"
+        f"<text y='.9em' font-size='90'>{icon}</text></svg>\">",
         f"<title>Daily Brief · {today:%-d %b}</title>",
-        f"<style>{CSS}</style></head><body>",
-        "<h1>Daily Brief</h1>",
-        f"<p class='meta'>{today.strftime('%A, %-d %B %Y')} · {CITY}</p>",
+        f"<style>{CSS}</style></head><body><div class='wrap'>",
+        "<header><h1>Daily Brief</h1>",
+        f"<p class='date'>{today.strftime('%A %-d %B')} · {CITY}</p></header>",
     ]
 
     if weather:
         w = weather
         p += [
-            "<h2>Weather</h2><div class='card'>",
-            f"<span class='temp'>{w['high']}°</span>"
-            f"<span class='cond'>{esc(w['cond'])}</span>",
-            f"<div class='wdetail'>Low {w['low']}° · {w['rain']}% chance of rain · "
-            f"wind {w['wind']} km/h<br>"
-            f"Sunrise {w['sunrise']} · Sunset {w['sunset']}</div></div>",
+            f"<div class='hero' style=\"background:linear-gradient(135deg,"
+            f"{tint[0]},{tint[1]})\">",
+            f"<div class='hero-emoji'>{w['emoji']}</div>",
+            "<div class='hero-main'>",
+            f"<div class='hero-temp'>{w['high']}°</div>",
+            f"<div class='hero-cond'>{esc(w['cond'])}</div></div>",
+            "<div class='hero-stats'>",
+            f"<div><div class='stat-v'>{w['low']}°</div>"
+            "<div class='stat-l'>Low</div></div>",
+            f"<div><div class='stat-v'>{w['rain']}%</div>"
+            "<div class='stat-l'>Rain</div></div>",
+            f"<div><div class='stat-v'>{w['wind']}</div>"
+            "<div class='stat-l'>km/h</div></div>",
+            f"<div><div class='stat-v'>{w['sunset']}</div>"
+            "<div class='stat-l'>Sunset</div></div>",
+            "</div></div>",
         ]
 
+    p.append("<div class='grid'>")
     for name, items in sections.items():
         if not items:
             continue
-        p.append(f"<h2>{esc(name)}</h2><div class='card'><ul>")
-        for i in items:
+        emoji, colour = SECTION_STYLE.get(name, ("•", "#888"))
+        p += [
+            "<section class='sec'>",
+            f"<h2><span class='dot' style='background:{colour}'></span>"
+            f"<span class='sec-emoji'>{emoji}</span>{esc(name)}</h2><ol>",
+        ]
+        for idx, i in enumerate(items):
+            img = i.get("image")
+            link = esc(i.get("url") or "")
             title = esc(i["title"])
-            link = i.get("url")
-            head = f"<a href='{esc(link)}'>{title}</a>" if link else title
-            p.append(f"<li><span class='t'>{head}</span>")
-            if i.get("summary"):
-                p.append(f"<span class='d'>{esc(i['summary'])}</span>")
-            p.append("</li>")
-        p.append("</ul></div>")
+            summary = esc(i.get("summary") or "")
 
-    p.append(f"<footer>Updated {today:%H:%M}</footer></body></html>")
+            # The first story in each section gets a full-width lead image.
+            if idx == 0 and img:
+                p.append("<li class='lead'>")
+                p.append(f"<a href='{link}'>" if link else "<div>")
+                p.append(f"<img class='lead-img' src='{esc(img)}' alt='' "
+                         "loading='lazy' referrerpolicy='no-referrer'>")
+                p.append(f"<span class='t'>{title}</span>")
+                if summary:
+                    p.append(f"<span class='d'>{summary}</span>")
+                p.append("</a>" if link else "</div>")
+                p.append("</li>")
+                continue
+
+            p.append("<li><span class='rank'></span>")
+            p.append(f"<a href='{link}' class='body'>" if link
+                     else "<div class='body'>")
+            p.append(f"<span class='t'>{title}</span>")
+            if summary:
+                p.append(f"<span class='d'>{summary}</span>")
+            p.append("</a>" if link else "</div>")
+            if img:
+                p.append(f"<img class='thumb' src='{esc(img)}' alt='' "
+                         "loading='lazy' referrerpolicy='no-referrer'>")
+            p.append("</li>")
+        p.append("</ol></section>")
+    p.append("</div>")
+
+    p.append(f"<footer>Updated {today:%H:%M} · {CITY}</footer>")
+    p.append("</div></body></html>")
     return "".join(p)
 
 
@@ -410,16 +516,17 @@ def render_markdown(weather, sections, page_url):
     if weather:
         w = weather
         lines += [
-            f"**{w['high']}°** · {w['cond']} · low {w['low']}° · "
-            f"{w['rain']}% rain · wind {w['wind']} km/h",
-            f"<sub>Sunrise {w['sunrise']} · Sunset {w['sunset']}</sub>",
+            f"## {w['emoji']} {w['high']}° · {w['cond']}",
+            f"Low {w['low']}° · {w['rain']}% rain · wind {w['wind']} km/h · "
+            f"sunset {w['sunset']}",
             "",
         ]
 
     for name, items in sections.items():
         if not items:
             continue
-        lines.append(f"### {name}")
+        emoji, _ = SECTION_STYLE.get(name, ("•", ""))
+        lines.append(f"### {emoji} {name}")
         for i in items:
             title = i["title"]
             link = i.get("url")

@@ -8,6 +8,11 @@ on:
     - cron: "0 5 * * *"   # 07:00 Copenhagen, summer (CEST)
     - cron: "0 6 * * *"   # 07:00 Copenhagen, winter (CET)
   workflow_dispatch:      # lets you trigger a run by hand from the Actions tab
+    inputs:
+      force:
+        description: "Run now even if it isn't 07:00 in Copenhagen"
+        type: boolean
+        default: true
 
 permissions:
   contents: write   # commit the updated page
@@ -33,12 +38,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Only needed if you want AI-written summaries.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Ticked on a manual run, empty on a scheduled one — so testing by
+          # hand always works, while the 07:00 guard still applies at 05:00
+          # and 06:00 UTC and only one of those two runs publishes.
+          FORCE_RUN: ${{ inputs.force && '1' || '0' }}
 
       - name: Commit the page
         run: |
+          # brief.py exits early when it is not 07:00 in Copenhagen, so on a
+          # skipped run this file does not exist and there is nothing to do.
+          if [ ! -f docs/index.html ]; then
+            echo "No page was built (run was skipped) — nothing to commit."
+            exit 0
+          fi
+
           git config user.name "daily-brief"
           git config user.email "actions@github.com"
           git add docs/index.html
-          # No commit if the run was skipped and the page is unchanged.
-          git diff --staged --quiet || git commit -m "Brief for $(date -u +%F)"
+
+          if git diff --staged --quiet; then
+            echo "Page unchanged — nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Brief for $(date -u +%F)"
+          # Another run may have pushed since checkout; rebase rather than fail.
+          git pull --rebase --autostash
           git push

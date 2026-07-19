@@ -47,8 +47,6 @@ jobs:
           # Optional sections — each is skipped if its key is missing.
           FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
           SPORTMONKS_KEY: ${{ secrets.SPORTMONKS_KEY }}
-          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
-          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           # Ticked on a manual run, empty on a scheduled one — so testing by
           # hand always works, while the 07:00 guard still applies at 05:00
           # and 06:00 UTC and only one of those two runs publishes.

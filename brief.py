@@ -1254,14 +1254,37 @@ def gh(method, path, **kw):
 
 
 def post_issue(repo, title, body):
-    """Open today's issue and close yesterday's so the list stays short."""
+    """
+    Open today's issue and close yesterday's so the list stays short.
+
+    The issue is assigned to the repo owner on purpose: GitHub Mobile only
+    sends push notifications for mentions, assignments and review requests —
+    watching a repo gets you email but never a push. Assigning is what makes
+    the phone buzz.
+    """
+    owner = repo.split("/", 1)[0]
+
     for old in gh("GET", f"/repos/{repo}/issues?labels=brief&state=open&per_page=20"):
         gh("PATCH", f"/repos/{repo}/issues/{old['number']}", json={"state": "closed"})
         print(f"  closed #{old['number']}")
 
-    issue = gh("POST", f"/repos/{repo}/issues",
-               json={"title": title, "body": body, "labels": ["brief"]})
-    print(f"  opened #{issue['number']}")
+    payload = {
+        "title": title,
+        "body": body,
+        "labels": ["brief"],
+        "assignees": [owner],
+    }
+    try:
+        issue = gh("POST", f"/repos/{repo}/issues", json=payload)
+    except Exception as e:
+        # An invalid assignee makes the whole call fail, so retry without it
+        # rather than lose the brief over a notification nicety.
+        print(f"  ! could not assign to {owner} ({e}) — posting unassigned",
+              file=sys.stderr)
+        payload.pop("assignees")
+        issue = gh("POST", f"/repos/{repo}/issues", json=payload)
+
+    print(f"  opened #{issue['number']} (assigned to {owner})")
 
 
 def pages_url(repo):

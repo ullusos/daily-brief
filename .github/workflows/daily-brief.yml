@@ -47,6 +47,7 @@ jobs:
           # Optional sections — each is skipped if its key is missing.
           FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
           SPORTMONKS_KEY: ${{ secrets.SPORTMONKS_KEY }}
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
           # Ticked on a manual run, empty on a scheduled one — so testing by
           # hand always works, while the 07:00 guard still applies at 05:00
           # and 06:00 UTC and only one of those two runs publishes.

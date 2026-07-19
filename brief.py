@@ -58,6 +58,21 @@ ITEMS_PER_SECTION = 5
 TIMEOUT = 20
 API = "https://api.github.com"
 
+# --- AI summarisation cost controls -----------------------------------------
+# Every call bills your Anthropic account, so these three settings are the
+# difference between pennies and pounds a month.
+#
+#   MODEL          claude-haiku-4-5-20251001 is roughly a tenth the price of
+#                  Sonnet and fine for rewriting headlines. Swap to
+#                  "claude-sonnet-5" if you want better prose.
+#   OVERFETCH      how many candidate stories per section the model chooses
+#                  from. 2x ITEMS_PER_SECTION is plenty; higher costs more.
+#   SUMMARY_CHARS  how much of each article the model sees. Enough for context,
+#                  not the whole piece.
+AI_MODEL = "claude-haiku-4-5-20251001"
+AI_OVERFETCH = 2
+AI_SUMMARY_CHARS = 200
+
 
 # ---------------------------------------------------------------- weather
 
@@ -104,6 +119,7 @@ def hero_tint(code):
 
 # Emoji and accent colour per section.
 SECTION_STYLE = {
+    "Power":       ("🔌", "#f2a541"),
     "Denmark":     ("🇩🇰", "#c8102e"),
     "World":       ("🌍", "#1a6fb4"),
     "Games":       ("🎮", "#7c4dff"),
@@ -111,6 +127,8 @@ SECTION_STYLE = {
     "GitHub":      ("🐙", "#6e5494"),
     "Hacker News": ("🔶", "#ff6600"),
     "Football":    ("⚽", "#2d8a4e"),
+    "Superliga":   ("🏟️", "#c8102e"),
+    "Music":       ("🎵", "#e0245e"),
     "Jobs":        ("💼", "#b8860b"),
 }
 
@@ -235,42 +253,88 @@ def fetch_power():
     taxes and VAT, so treat these as relative rather than absolute.
     """
     today = dt.datetime.now(TZ).date()
-    try:
-        r = requests.get(
-            "https://api.energidataservice.dk/dataset/Elspotprices",
-            params={
-                "start": f"{today}T00:00",
-                "end": f"{today + dt.timedelta(days=1)}T00:00",
-                "filter": json.dumps({"PriceArea": ["DK2"]}),
-                "columns": "HourDK,SpotPriceDKK",
-                "sort": "HourDK ASC",
-                "limit": 100,
-            },
-            timeout=TIMEOUT,
-        )
-        r.raise_for_status()
-        hours = []
-        for rec in r.json().get("records", []):
-            price = rec.get("SpotPriceDKK")
-            stamp = rec.get("HourDK") or ""
-            if price is None or len(stamp) < 16:
+    tomorrow = today + dt.timedelta(days=1)
+    base = "https://api.energidataservice.dk/dataset/Elspotprices"
+
+    # Two attempts: the precise query first, then a looser one. If naming their
+    # columns or sort order is what's breaking it, the second still works.
+    attempts = [
+        {
+            "start": f"{today}T00:00",
+            "end": f"{tomorrow}T00:00",
+            "filter": json.dumps({"PriceArea": ["DK2"]}),
+            "columns": "HourDK,SpotPriceDKK",
+            "sort": "HourDK ASC",
+            "limit": 100,
+        },
+        {
+            "start": f"{today}T00:00",
+            "end": f"{tomorrow}T00:00",
+            "filter": json.dumps({"PriceArea": ["DK2"]}),
+            "limit": 100,
+        },
+    ]
+
+    for n, params in enumerate(attempts, 1):
+        try:
+            r = requests.get(base, params=params, timeout=TIMEOUT)
+            if r.status_code >= 400:
+                print(f"  ! power attempt {n}: HTTP {r.status_code} — "
+                      f"{r.text[:200]}", file=sys.stderr)
                 continue
-            hours.append({"hour": stamp[11:16], "ore": round(price / 10, 1)})
 
-        if not hours:
-            return None
+            payload = r.json()
+            records = payload.get("records") or []
+            if not records:
+                print(f"  ! power attempt {n}: HTTP 200 but zero records. "
+                      f"url={r.url} body={json.dumps(payload)[:250]}",
+                      file=sys.stderr)
+                continue
 
-        cheap = min(hours, key=lambda h: h["ore"])
-        dear = max(hours, key=lambda h: h["ore"])
-        return {
-            "hours": hours,
-            "avg": round(sum(h["ore"] for h in hours) / len(hours), 1),
-            "cheap": cheap,
-            "dear": dear,
-        }
-    except Exception as e:
-        print(f"  ! power prices failed: {e}", file=sys.stderr)
-        return None
+            hours = _parse_power(records)
+            if not hours:
+                print(f"  ! power attempt {n}: {len(records)} records but none "
+                      f"parsable. First record: {json.dumps(records[0])[:250]}",
+                      file=sys.stderr)
+                continue
+
+            hours.sort(key=lambda h: h["hour"])
+            return {
+                "hours": hours,
+                "avg": round(sum(h["ore"] for h in hours) / len(hours), 1),
+                "cheap": min(hours, key=lambda h: h["ore"]),
+                "dear": max(hours, key=lambda h: h["ore"]),
+            }
+        except Exception as e:
+            print(f"  ! power attempt {n} failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+
+    return None
+
+
+def _parse_power(records):
+    """
+    Pull hour and price out of the records without hardcoding column names —
+    match on substring instead, so a renamed field doesn't kill the section.
+    """
+    sample = records[0]
+    hour_key = next((k for k in sample if "hour" in k.lower()
+                     or "time" in k.lower()), None)
+    price_key = next((k for k in sample if "spotprice" in k.lower()
+                      and "eur" not in k.lower()), None)
+    if not price_key:
+        price_key = next((k for k in sample if "price" in k.lower()), None)
+    if not (hour_key and price_key):
+        return []
+
+    hours = []
+    for rec in records:
+        price, stamp = rec.get(price_key), str(rec.get(hour_key) or "")
+        if price is None or len(stamp) < 16:
+            continue
+        # DKK per MWh -> øre per kWh.
+        hours.append({"hour": stamp[11:16], "ore": round(float(price) / 10, 1)})
+    return hours
 
 
 def fetch_github_trending(limit=5):
@@ -393,6 +457,96 @@ def fetch_football(limit=6):
         return []
 
 
+def fetch_superliga(limit=4):
+    """
+    Danish Superliga fixtures and results via Sportmonks, whose free plan
+    covers exactly the Superliga and the Scottish Premiership.
+
+    Uses the fixture's own `name` and `result_info` strings rather than
+    unpicking the scores array, which is both simpler and less likely to break
+    if their response shape shifts.
+
+    Skipped silently when SPORTMONKS_KEY isn't set.
+    """
+    key = os.environ.get("SPORTMONKS_KEY")
+    if not key:
+        return []
+
+    today = dt.datetime.now(TZ).date()
+    yesterday = today - dt.timedelta(days=1)
+    try:
+        r = requests.get(
+            "https://api.sportmonks.com/v3/football/fixtures/between/"
+            f"{yesterday}/{today}",
+            params={"api_token": key},
+            timeout=TIMEOUT,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+
+        played, upcoming = [], []
+        for fx in r.json().get("data", []) or []:
+            name = (fx.get("name") or "").replace(" vs ", " v ").strip()
+            if not name:
+                continue
+            result = (fx.get("result_info") or "").strip()
+
+            if result:
+                played.append({
+                    "title": name, "summary": result, "url": "", "image": None,
+                })
+                continue
+
+            clock = ""
+            starts = fx.get("starting_at") or ""
+            try:
+                # Sportmonks returns "YYYY-MM-DD HH:MM:SS" in UTC.
+                stamp = dt.datetime.strptime(starts, "%Y-%m-%d %H:%M:%S")
+                local = stamp.replace(tzinfo=dt.timezone.utc).astimezone(TZ)
+                if local.date() != today:
+                    continue
+                clock = f"kicks off {local:%H:%M}"
+            except Exception:
+                clock = "today"
+            upcoming.append({
+                "title": name, "summary": f"Superliga · {clock}",
+                "url": "", "image": None,
+            })
+
+        return (upcoming + played)[:limit]
+    except Exception as e:
+        print(f"  ! superliga failed: {e}", file=sys.stderr)
+        return []
+
+
+def fetch_music(limit=5, country="dk"):
+    """
+    Most-played songs from Apple's marketing RSS feed. No key, no signup,
+    updated daily. Apple publishes this per country — there is no global
+    chart, so this is Denmark only.
+    """
+    try:
+        r = requests.get(
+            f"https://rss.marketingtools.apple.com/api/v2/{country}/music/"
+            f"most-played/{limit}/songs.json",
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        out = []
+        for song in r.json().get("feed", {}).get("results", [])[:limit]:
+            art = song.get("artworkUrl100") or None
+            out.append({
+                "title": song.get("name", "").strip(),
+                "summary": song.get("artistName", "").strip(),
+                "url": song.get("url", ""),
+                "image": art,
+            })
+        return out
+    except Exception as e:
+        print(f"  ! music failed: {e}", file=sys.stderr)
+        return []
+
+
 # Tune these to change which jobs show up.
 JOB_QUERY = "software developer engineer udvikler programmør"
 JOB_WHERE = "København"
@@ -462,8 +616,15 @@ def summarize(sections):
     if not key:
         return sections
 
+    # Manual runs are for checking feeds and layout, not prose — and every
+    # call costs money. SKIP_AI keeps testing free.
+    if os.environ.get("SKIP_AI") == "1":
+        print("  (skipping AI summaries — SKIP_AI is set)")
+        return sections
+
     payload = {
-        name: [{"title": i["title"], "summary": i["summary"]} for i in items]
+        name: [{"title": i["title"],
+                "summary": i["summary"][:AI_SUMMARY_CHARS]} for i in items]
         for name, items in sections.items()
     }
     prompt = (
@@ -487,7 +648,7 @@ def summarize(sections):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-5",
+                "model": AI_MODEL,
                 "max_tokens": 4000,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -696,10 +857,11 @@ def render_power(power):
             f"title='{h['hour']} — {h['ore']} øre'></div>"
         )
 
+    emoji, colour = SECTION_STYLE["Power"]
     return [
         "<section class='power' data-sec='Power'>",
-        "<h2><span class='dot' style='background:#f2a541'></span>"
-        "<span class='sec-emoji'>🔌</span>Electricity</h2>",
+        f"<h2><span class='dot' style='background:{colour}'></span>"
+        f"<span class='sec-emoji'>{emoji}</span>Electricity</h2>",
         "<div class='pgrid'>",
         f"<div><div class='pv'>{power['avg']}<small>øre</small></div>"
         "<div class='pl'>Average</div></div>",
@@ -767,7 +929,7 @@ def render_html(weather, sections, today, power=None):
         p.append("<div class='chips' role='group' aria-label='Filter sections'>")
         p.append("<button class='chip' data-all aria-pressed='true'>All</button>")
         for n in names:
-            emoji, _ = SECTION_STYLE.get(n, ("🔌" if n == "Power" else "•", ""))
+            emoji, _ = SECTION_STYLE.get(n, ("•", "#888"))
             p.append(f"<button class='chip' data-target='{esc(n)}' "
                      f"aria-pressed='true'>{emoji} {esc(n)}</button>")
         p.append("</div>")
@@ -875,7 +1037,8 @@ def render_markdown(weather, sections, page_url, power=None):
 
     if power:
         lines += [
-            f"🔌 **Power** {power['avg']} øre/kWh average · "
+            f"{SECTION_STYLE['Power'][0]} **Power** "
+            f"{power['avg']} øre/kWh average · "
             f"cheapest {power['cheap']['ore']} at {power['cheap']['hour']} · "
             f"priciest {power['dear']['ore']} at {power['dear']['hour']}",
             "",
@@ -948,10 +1111,13 @@ def main():
 
     weather = fetch_weather()
     sections = {}
-    use_ai = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    use_ai = bool(os.environ.get("ANTHROPIC_API_KEY")) \
+        and os.environ.get("SKIP_AI") != "1"
     for name, urls in FEEDS.items():
-        # Over-fetch so the AI has a real choice of stories to pick from.
-        sections[name] = fetch_section(urls, ITEMS_PER_SECTION * 4 if use_ai else ITEMS_PER_SECTION)
+        # Over-fetch so the AI has a real choice — but only when it will run,
+        # since every extra candidate is input tokens you pay for.
+        sections[name] = fetch_section(
+            urls, ITEMS_PER_SECTION * AI_OVERFETCH if use_ai else ITEMS_PER_SECTION)
         print(f"  {name}: {len(sections[name])} items")
 
     # Only the RSS sections go through the AI — the rest arrive clean already.
@@ -964,9 +1130,13 @@ def main():
     sections["Hacker News"] = fetch_hackernews()
     print(f"  Hacker News: {len(sections['Hacker News'])} stories")
 
-    # These two skip themselves when their keys aren't set.
+    # These skip themselves when their keys aren't set.
+    sections["Superliga"] = fetch_superliga()
+    print(f"  Superliga: {len(sections['Superliga'])} matches")
     sections["Football"] = fetch_football()
     print(f"  Football: {len(sections['Football'])} matches")
+    sections["Music"] = fetch_music()
+    print(f"  Music: {len(sections['Music'])} tracks")
     sections["Jobs"] = fetch_jobs()
     print(f"  Jobs: {len(sections['Jobs'])} listings")
 

@@ -1,0 +1,44 @@
+name: Daily Brief
+
+on:
+  schedule:
+    # GitHub cron runs on UTC and does not follow daylight saving, so we fire
+    # at both candidate times. brief.py checks the real Copenhagen clock and
+    # exits immediately unless it is 07:00 there — so exactly one run publishes.
+    - cron: "0 5 * * *"   # 07:00 Copenhagen, summer (CEST)
+    - cron: "0 6 * * *"   # 07:00 Copenhagen, winter (CET)
+  workflow_dispatch:      # lets you trigger a run by hand from the Actions tab
+
+permissions:
+  contents: write   # commit the updated page
+  issues: write     # open the notification issue
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet requests feedparser
+
+      - name: Build and publish
+        run: python brief.py
+        env:
+          # Provided automatically by Actions — nothing for you to set up.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only needed if you want AI-written summaries.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Commit the page
+        run: |
+          git config user.name "daily-brief"
+          git config user.email "actions@github.com"
+          git add docs/index.html
+          # No commit if the run was skipped and the page is unchanged.
+          git diff --staged --quiet || git commit -m "Brief for $(date -u +%F)"
+          git push

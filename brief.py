@@ -129,8 +129,19 @@ SECTION_STYLE = {
     "Football":    ("⚽", "#2d8a4e"),
     "Superliga":   ("🏟️", "#c8102e"),
     "Music":       ("🎵", "#e0245e"),
-    "Jobs":        ("💼", "#b8860b"),
 }
+
+# Shown when a section ran successfully but had nothing to report — so you can
+# tell "nothing happened today" apart from "this is broken". Sections whose
+# API key is missing never get here; they stay hidden.
+EMPTY_STATE = {
+    "Superliga":   "No Superliga matches today",
+    "Football":    "No matches today",
+    "Music":       "Chart unavailable right now",
+    "GitHub":      "Couldn't reach GitHub search",
+    "Hacker News": "Couldn't reach Hacker News",
+}
+EMPTY_DEFAULT = "Nothing from these feeds today"
 
 
 def fetch_weather():
@@ -254,86 +265,90 @@ def fetch_power():
     """
     today = dt.datetime.now(TZ).date()
     tomorrow = today + dt.timedelta(days=1)
-    base = "https://api.energidataservice.dk/dataset/Elspotprices"
 
-    # Two attempts: the precise query first, then a looser one. If naming their
-    # columns or sort order is what's breaking it, the second still works.
-    attempts = [
-        {
-            "start": f"{today}T00:00",
-            "end": f"{tomorrow}T00:00",
-            "filter": json.dumps({"PriceArea": ["DK2"]}),
-            "columns": "HourDK,SpotPriceDKK",
-            "sort": "HourDK ASC",
-            "limit": 100,
-        },
-        {
-            "start": f"{today}T00:00",
-            "end": f"{tomorrow}T00:00",
-            "filter": json.dumps({"PriceArea": ["DK2"]}),
-            "limit": 100,
-        },
-    ]
-
-    for n, params in enumerate(attempts, 1):
-        try:
-            r = requests.get(base, params=params, timeout=TIMEOUT)
-            if r.status_code >= 400:
-                print(f"  ! power attempt {n}: HTTP {r.status_code} — "
-                      f"{r.text[:200]}", file=sys.stderr)
-                continue
-
-            payload = r.json()
-            records = payload.get("records") or []
-            if not records:
-                print(f"  ! power attempt {n}: HTTP 200 but zero records. "
-                      f"url={r.url} body={json.dumps(payload)[:250]}",
-                      file=sys.stderr)
-                continue
-
-            hours = _parse_power(records)
-            if not hours:
-                print(f"  ! power attempt {n}: {len(records)} records but none "
-                      f"parsable. First record: {json.dumps(records[0])[:250]}",
-                      file=sys.stderr)
-                continue
-
-            hours.sort(key=lambda h: h["hour"])
-            return {
-                "hours": hours,
-                "avg": round(sum(h["ore"] for h in hours) / len(hours), 1),
-                "cheap": min(hours, key=lambda h: h["ore"]),
-                "dear": max(hours, key=lambda h: h["ore"]),
-            }
-        except Exception as e:
-            print(f"  ! power attempt {n} failed: {type(e).__name__}: {e}",
+    # Elspotprices was discontinued — it stops at 2025-09-30 and now returns a
+    # perfectly valid, perfectly empty response. DayAheadPrices replaced it.
+    #
+    # One request only: the API rate-limits hard, and its 429 asks for a
+    # 300-second wait, so an immediate retry is worse than useless.
+    try:
+        r = requests.get(
+            "https://api.energidataservice.dk/dataset/DayAheadPrices",
+            params={
+                "start": f"{today}T00:00",
+                "end": f"{tomorrow}T00:00",
+                "filter": json.dumps({"PriceArea": ["DK2"]}),
+                "limit": 100,
+            },
+            timeout=TIMEOUT,
+        )
+        if r.status_code >= 400:
+            print(f"  ! power: HTTP {r.status_code} — {r.text[:200]}",
                   file=sys.stderr)
+            return None
 
-    return None
+        payload = r.json()
+        records = payload.get("records") or []
+        if not records:
+            print(f"  ! power: HTTP 200 but zero records. url={r.url} "
+                  f"body={json.dumps(payload)[:250]}", file=sys.stderr)
+            return None
+
+        hours = _parse_power(records)
+        if not hours:
+            print(f"  ! power: {len(records)} records but none parsable. "
+                  f"First record: {json.dumps(records[0])[:250]}",
+                  file=sys.stderr)
+            return None
+
+        hours.sort(key=lambda h: h["hour"])
+        return {
+            "hours": hours,
+            "avg": round(sum(h["ore"] for h in hours) / len(hours), 1),
+            "cheap": min(hours, key=lambda h: h["ore"]),
+            "dear": max(hours, key=lambda h: h["ore"]),
+        }
+    except Exception as e:
+        print(f"  ! power failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
 
 
 def _parse_power(records):
     """
-    Pull hour and price out of the records without hardcoding column names —
-    match on substring instead, so a renamed field doesn't kill the section.
+    Find the timestamp and price columns without hardcoding their names, so a
+    future rename doesn't kill the section again.
+
+    The price column must hold a *number* — 'PriceArea' contains the word
+    price but holds "DK2", and matching it would blow up on float().
     """
     sample = records[0]
-    hour_key = next((k for k in sample if "hour" in k.lower()
-                     or "time" in k.lower()), None)
-    price_key = next((k for k in sample if "spotprice" in k.lower()
-                      and "eur" not in k.lower()), None)
-    if not price_key:
-        price_key = next((k for k in sample if "price" in k.lower()), None)
-    if not (hour_key and price_key):
+
+    def is_number(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    times = [k for k in sample
+             if ("hour" in k.lower() or "time" in k.lower())
+             and isinstance(sample[k], str)]
+    # Prefer local time so displayed hours are Danish, not UTC.
+    time_key = next((k for k in times if k.lower().endswith("dk")), None) \
+        or (times[0] if times else None)
+
+    prices = [k for k in sample
+              if "price" in k.lower() and is_number(sample[k])
+              and "eur" not in k.lower()]
+    price_key = next((k for k in prices if "dkk" in k.lower()), None) \
+        or (prices[0] if prices else None)
+
+    if not (time_key and price_key):
         return []
 
     hours = []
     for rec in records:
-        price, stamp = rec.get(price_key), str(rec.get(hour_key) or "")
-        if price is None or len(stamp) < 16:
+        price, stamp = rec.get(price_key), str(rec.get(time_key) or "")
+        if not is_number(price) or len(stamp) < 16:
             continue
         # DKK per MWh -> øre per kWh.
-        hours.append({"hour": stamp[11:16], "ore": round(float(price) / 10, 1)})
+        hours.append({"hour": stamp[11:16], "ore": round(price / 10, 1)})
     return hours
 
 
@@ -399,7 +414,7 @@ def fetch_football(limit=6):
     """
     key = os.environ.get("FOOTBALL_DATA_KEY")
     if not key:
-        return []
+        return None   # not configured — hide the section entirely
 
     today = dt.datetime.now(TZ).date()
     yesterday = today - dt.timedelta(days=1)
@@ -470,7 +485,7 @@ def fetch_superliga(limit=4):
     """
     key = os.environ.get("SPORTMONKS_KEY")
     if not key:
-        return []
+        return None   # not configured — hide the section entirely
 
     today = dt.datetime.now(TZ).date()
     yesterday = today - dt.timedelta(days=1)
@@ -544,62 +559,6 @@ def fetch_music(limit=5, country="dk"):
         return out
     except Exception as e:
         print(f"  ! music failed: {e}", file=sys.stderr)
-        return []
-
-
-# Tune these to change which jobs show up.
-JOB_QUERY = "software developer engineer udvikler programmør"
-JOB_WHERE = "København"
-JOB_MAX_AGE_DAYS = 3
-
-
-def fetch_jobs(limit=5):
-    """
-    Recent software roles near Copenhagen via Adzuna.
-    Skipped silently unless both ADZUNA_APP_ID and ADZUNA_APP_KEY are set.
-    """
-    app_id = os.environ.get("ADZUNA_APP_ID")
-    app_key = os.environ.get("ADZUNA_APP_KEY")
-    if not (app_id and app_key):
-        return []
-
-    try:
-        r = requests.get(
-            "https://api.adzuna.com/v1/api/jobs/dk/search/1",
-            params={
-                "app_id": app_id,
-                "app_key": app_key,
-                "what_or": JOB_QUERY,
-                "where": JOB_WHERE,
-                "max_days_old": JOB_MAX_AGE_DAYS,
-                "results_per_page": limit,
-                "sort_by": "date",
-                "content-type": "application/json",
-            },
-            timeout=TIMEOUT,
-        )
-        if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-
-        out = []
-        for job in r.json().get("results", [])[:limit]:
-            company = (job.get("company") or {}).get("display_name", "").strip()
-            where = (job.get("location") or {}).get("display_name", "").strip()
-            bits = [b for b in (company, where) if b]
-
-            lo, hi = job.get("salary_min"), job.get("salary_max")
-            if lo and hi:
-                bits.append(f"{int(lo):,}–{int(hi):,} kr".replace(",", "."))
-
-            out.append({
-                "title": (job.get("title") or "").strip(),
-                "summary": " · ".join(bits),
-                "url": job.get("redirect_url", ""),
-                "image": None,
-            })
-        return out
-    except Exception as e:
-        print(f"  ! jobs failed: {e}", file=sys.stderr)
         return []
 
 
@@ -792,6 +751,7 @@ li:first-child{border-top:none;padding-top:2px}
 .d{font-size:14px;color:var(--dim);margin-top:4px;line-height:1.45}
 .thumb{width:74px;height:74px;border-radius:11px;object-fit:cover;flex:none;
   background:var(--line)}
+.empty{font-size:14px;color:var(--dim);margin:0 0 14px;font-style:italic}
 li.lead{display:block}
 li.lead .lead-img{width:100%;height:172px;object-fit:cover;border-radius:12px;
   margin-bottom:11px;background:var(--line);display:block}
@@ -923,8 +883,9 @@ def render_html(weather, sections, today, power=None):
             "</div></div>",
         ]
 
-    # Filter chips — every section that actually has content today.
-    names = (["Power"] if power else []) + [n for n, i in sections.items() if i]
+    # Filter chips — every section present today, including ones that ran but
+    # came back empty. Sections with no API key aren't in `sections` at all.
+    names = (["Power"] if power else []) + list(sections)
     if names:
         p.append("<div class='chips' role='group' aria-label='Filter sections'>")
         p.append("<button class='chip' data-all aria-pressed='true'>All</button>")
@@ -938,14 +899,17 @@ def render_html(weather, sections, today, power=None):
 
     p.append("<div class='grid'>")
     for name, items in sections.items():
-        if not items:
-            continue
         emoji, colour = SECTION_STYLE.get(name, ("•", "#888"))
         p += [
             f"<section class='sec' data-sec='{esc(name)}'>",
             f"<h2><span class='dot' style='background:{colour}'></span>"
-            f"<span class='sec-emoji'>{emoji}</span>{esc(name)}</h2><ol>",
+            f"<span class='sec-emoji'>{emoji}</span>{esc(name)}</h2>",
         ]
+        if not items:
+            note = EMPTY_STATE.get(name, EMPTY_DEFAULT)
+            p.append(f"<p class='empty'>{esc(note)}</p></section>")
+            continue
+        p.append("<ol>")
         for idx, i in enumerate(items):
             img = i.get("image")
             link = esc(i.get("url") or "")
@@ -1045,10 +1009,11 @@ def render_markdown(weather, sections, page_url, power=None):
         ]
 
     for name, items in sections.items():
-        if not items:
-            continue
         emoji, _ = SECTION_STYLE.get(name, ("•", ""))
         lines.append(f"### {emoji} {name}")
+        if not items:
+            lines += [f"*{EMPTY_STATE.get(name, EMPTY_DEFAULT)}*", ""]
+            continue
         for i in items:
             title = i["title"]
             link = i.get("url")
@@ -1130,15 +1095,20 @@ def main():
     sections["Hacker News"] = fetch_hackernews()
     print(f"  Hacker News: {len(sections['Hacker News'])} stories")
 
-    # These skip themselves when their keys aren't set.
-    sections["Superliga"] = fetch_superliga()
-    print(f"  Superliga: {len(sections['Superliga'])} matches")
-    sections["Football"] = fetch_football()
-    print(f"  Football: {len(sections['Football'])} matches")
-    sections["Music"] = fetch_music()
-    print(f"  Music: {len(sections['Music'])} tracks")
-    sections["Jobs"] = fetch_jobs()
-    print(f"  Jobs: {len(sections['Jobs'])} listings")
+    # A fetcher returning None means "no key configured" — that section is
+    # hidden. Returning [] means it ran and found nothing, which is worth
+    # saying out loud rather than silently dropping.
+    def add(name, result, unit):
+        if result is None:
+            print(f"  {name}: not configured")
+            return
+        sections[name] = result
+        print(f"  {name}: {len(result)} {unit}"
+              + ("" if result else "  → will show an empty-state note"))
+
+    add("Superliga", fetch_superliga(), "matches")
+    add("Football", fetch_football(), "matches")
+    add("Music", fetch_music(), "tracks")
 
     power = fetch_power()
     print(f"  Power: {'ok' if power else 'unavailable'}")

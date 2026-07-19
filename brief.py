@@ -16,6 +16,7 @@ Environment variables (Actions provides the first two automatically):
 """
 
 import os
+import re
 import sys
 import html
 import json
@@ -69,6 +70,46 @@ WEATHER_CODES = {
     96: "Thunderstorms with hail", 99: "Severe thunderstorms",
 }
 
+WEATHER_EMOJI = {
+    0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️", 45: "🌫️", 48: "🌫️",
+    51: "🌦️", 53: "🌦️", 55: "🌧️", 61: "🌦️", 63: "🌧️", 65: "🌧️",
+    71: "🌨️", 73: "🌨️", 75: "❄️", 80: "🌦️", 81: "🌧️", 82: "⛈️",
+    95: "⛈️", 96: "⛈️", 99: "🌩️",
+}
+
+# Background wash behind the weather hero, by rough condition family.
+HERO_TINT = {
+    "clear":  ("#f9d976", "#f39f52"),
+    "cloud":  ("#8ea6c0", "#5d7793"),
+    "rain":   ("#5b8fc9", "#33587f"),
+    "snow":   ("#cfe3f2", "#93b6d4"),
+    "storm":  ("#6c5ce7", "#3b3070"),
+    "fog":    ("#b6bcc4", "#7e858e"),
+}
+
+
+def hero_tint(code):
+    if code in (0, 1):
+        return HERO_TINT["clear"]
+    if code in (45, 48):
+        return HERO_TINT["fog"]
+    if code in (71, 73, 75):
+        return HERO_TINT["snow"]
+    if code in (95, 96, 99):
+        return HERO_TINT["storm"]
+    if code in (51, 53, 55, 61, 63, 65, 80, 81, 82):
+        return HERO_TINT["rain"]
+    return HERO_TINT["cloud"]
+
+
+# Emoji and accent colour per section.
+SECTION_STYLE = {
+    "Denmark": ("🇩🇰", "#c8102e"),
+    "World":   ("🌍", "#1a6fb4"),
+    "Games":   ("🎮", "#7c4dff"),
+    "Tech":    ("⚡", "#0f9b8e"),
+}
+
 
 def fetch_weather():
     """Today's forecast from Open-Meteo. No API key needed."""
@@ -81,12 +122,15 @@ def fetch_weather():
     )
     try:
         d = requests.get(url, timeout=TIMEOUT).json()["daily"]
+        code = d["weather_code"][0]
         return {
             "high": round(d["temperature_2m_max"][0]),
             "low": round(d["temperature_2m_min"][0]),
             "rain": d["precipitation_probability_max"][0],
             "wind": round(d["wind_speed_10m_max"][0]),
-            "cond": WEATHER_CODES.get(d["weather_code"][0], "—"),
+            "code": code,
+            "cond": WEATHER_CODES.get(code, "—"),
+            "emoji": WEATHER_EMOJI.get(code, "🌡️"),
             "sunrise": d["sunrise"][0][11:16],
             "sunset": d["sunset"][0][11:16],
         }
@@ -120,6 +164,7 @@ def fetch_section(urls, limit):
                     "title": e.get("title", "").strip(),
                     "url": e.get("link", ""),
                     "summary": strip_tags(e.get("summary", ""))[:400],
+                    "image": extract_image(e),
                     "ts": ts,
                 })
         except Exception as e:
@@ -134,6 +179,29 @@ def fetch_section(urls, limit):
         seen.add(key)
         unique.append(i)
     return unique[:limit]
+
+
+def extract_image(entry):
+    """
+    Find a thumbnail for an article. Feeds advertise images in several
+    different ways, so try each in turn and give up quietly.
+    """
+    for key in ("media_content", "media_thumbnail"):
+        media = entry.get(key) or []
+        for m in media:
+            url = m.get("url")
+            if url and not url.endswith(".svg"):
+                return url
+
+    for enc in entry.get("enclosures", []) or []:
+        if enc.get("type", "").startswith("image/") and enc.get("href"):
+            return enc["href"]
+
+    # Last resort: the first <img> inside the description HTML.
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)', entry.get("summary", ""), re.I)
+    if m and m.group(1).startswith("http"):
+        return m.group(1)
+    return None
 
 
 def strip_tags(s):
@@ -187,18 +255,44 @@ def summarize(sections):
             },
             json={
                 "model": "claude-sonnet-5",
-                "max_tokens": 2000,
+                "max_tokens": 4000,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=90,
         )
-        r.raise_for_status()
-        text = r.json()["content"][0]["text"].strip()
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+
+        data = r.json()
+
+        # The response may contain several content blocks and they are not all
+        # text, so pick out the text ones rather than assuming the first block.
+        text = "".join(
+            b.get("text", "") for b in data.get("content", [])
+            if b.get("type") == "text"
+        ).strip()
+
+        if not text:
+            kinds = [b.get("type") for b in data.get("content", [])]
+            raise RuntimeError(
+                f"no text in response; blocks={kinds} "
+                f"stop_reason={data.get('stop_reason')}"
+            )
+        if data.get("stop_reason") == "max_tokens":
+            raise RuntimeError("response hit max_tokens and was cut off mid-JSON")
+
         if text.startswith("```"):
-            text = text.split("```")[1].lstrip("json").strip()
+            text = text.split("```")[1]
+            if text.lstrip().startswith("json"):
+                text = text.lstrip()[4:]
+            text = text.strip()
+
         rewritten = json.loads(text)
+        if not isinstance(rewritten, dict):
+            raise RuntimeError(f"expected a JSON object, got {type(rewritten).__name__}")
     except Exception as e:
-        print(f"  ! AI summarize failed, using raw headlines: {e}", file=sys.stderr)
+        print(f"  ! AI summarize failed, using raw headlines: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
         return sections
 
     out = {}

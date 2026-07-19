@@ -566,8 +566,8 @@ def fetch_music(limit=10, country="dk"):
         return []
 
 
-APPLE_GLOBAL_URL = ("https://music.apple.com/us/new/top-charts/"
-                    "daily-global-top-charts")
+APPLE_GLOBAL_URL = ("https://music.apple.com/us/playlist/top-100-global/"
+                    "pl.d25f5d1181894928af76c85c967f8f31")
 
 
 def fetch_music_global(limit=10):
@@ -591,34 +591,94 @@ def fetch_music_global(limit=10):
 
 
 def _scrape_apple_global(limit):
-    """Pull the chart out of Apple's embedded JSON. Best effort by design."""
+    """
+    Pull the Top 100 Global chart off Apple's playlist page.
+
+    Two strategies, because it isn't guaranteed which one the server sends:
+      1. the <script id="serialized-server-data"> JSON blob
+      2. the rendered track rows, which carry data-testid attributes
+
+    Both are undocumented. This is best-effort by design.
+    """
     try:
         r = requests.get(
             APPLE_GLOBAL_URL,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; daily-brief/1.0)"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             timeout=TIMEOUT,
         )
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}")
 
+        found = _parse_apple_rows(r.text, limit)
+        if found:
+            return found
+
         m = re.search(
             r'<script[^>]+id="serialized-server-data"[^>]*>(.*?)</script>',
             r.text, re.S)
-        if not m:
-            print("  ! apple global: no serialized-server-data block found "
-                  "(page structure changed)", file=sys.stderr)
-            return []
-
-        found = []
-        _walk_for_tracks(json.loads(m.group(1)), found, limit)
-        if not found:
-            print("  ! apple global: JSON found but no tracks recognised",
+        if m:
+            found = []
+            _walk_for_tracks(json.loads(m.group(1)), found, limit)
+            if found:
+                return found[:limit]
+            print("  ! apple global: JSON blob found but no tracks recognised",
                   file=sys.stderr)
-        return found[:limit]
+        else:
+            print(f"  ! apple global: no track rows and no JSON blob "
+                  f"({len(r.text):,} bytes returned — page is probably "
+                  f"rendered client-side)", file=sys.stderr)
+        return []
     except Exception as e:
         print(f"  ! apple global failed: {type(e).__name__}: {e}",
               file=sys.stderr)
         return []
+
+
+def _parse_apple_rows(html_text, limit):
+    """
+    Parse the rendered track rows. Each row looks like:
+
+      <div ... data-testid="track-list-item" aria-label="Song, Artist">
+        ... data-testid="track-title">Song</div>
+        ... data-testid="track-title-by-line" ...>Artist</div>
+        ... data-testid="track-ranking">1</div>
+    """
+    rows = html_text.split('data-testid="track-list-item"')[1:]
+    out = []
+    for row in rows[:limit]:
+        title = re.search(r'data-testid="track-title"[^>]*>([^<]+)<', row)
+        if not title:
+            continue
+
+        artist = ""
+        byline = re.search(
+            r'data-testid="track-title-by-line"(.*?)</div>', row, re.S)
+        if byline:
+            names = re.findall(r'>([^<>]+)</a>', byline.group(1))
+            artist = ", ".join(n.strip() for n in names if n.strip())
+
+        link = re.search(
+            r'href="(https://music\.apple\.com/[^"]*?/song/[^"]+)"', row)
+
+        art = None
+        src = re.search(r'srcset="(https://is\d[^\s",]+)', row)
+        if src:
+            # Apple serves 40px thumbs here; ask for something legible.
+            art = re.sub(r"/\d+x\d+bb\.(webp|jpg)", "/200x200bb.jpg",
+                         src.group(1))
+
+        out.append({
+            "title": html.unescape(title.group(1)).strip(),
+            "summary": html.unescape(artist),
+            "url": link.group(1) if link else "",
+            "image": art,
+        })
+    return out
 
 
 def _walk_for_tracks(node, found, limit):

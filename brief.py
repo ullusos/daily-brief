@@ -128,7 +128,8 @@ SECTION_STYLE = {
     "Hacker News": ("🔶", "#ff6600"),
     "Football":    ("⚽", "#2d8a4e"),
     "Superliga":   ("🏟️", "#c8102e"),
-    "Music":       ("🎵", "#e0245e"),
+    "Music · DK":     ("🎵", "#e0245e"),
+    "Music · Global": ("🌐", "#8e44ad"),
 }
 
 # Shown when a section ran successfully but had nothing to report — so you can
@@ -137,7 +138,8 @@ SECTION_STYLE = {
 EMPTY_STATE = {
     "Superliga":   "No Superliga matches today",
     "Football":    "No matches today",
-    "Music":       "Chart unavailable right now",
+    "Music · DK":     "Chart unavailable right now",
+    "Music · Global": "Chart unavailable right now",
     "GitHub":      "Couldn't reach GitHub search",
     "Hacker News": "Couldn't reach Hacker News",
 }
@@ -534,11 +536,13 @@ def fetch_superliga(limit=4):
         return []
 
 
-def fetch_music(limit=5, country="dk"):
+def fetch_music(limit=10, country="dk"):
     """
     Most-played songs from Apple's marketing RSS feed. No key, no signup,
-    updated daily. Apple publishes this per country — there is no global
-    chart, so this is Denmark only.
+    updated daily.
+
+    Apple publishes per storefront using ISO country codes — there is no
+    global storefront in this feed, so each call is one country.
     """
     try:
         r = requests.get(
@@ -559,6 +563,148 @@ def fetch_music(limit=5, country="dk"):
         return out
     except Exception as e:
         print(f"  ! music failed: {e}", file=sys.stderr)
+        return []
+
+
+APPLE_GLOBAL_URL = ("https://music.apple.com/us/new/top-charts/"
+                    "daily-global-top-charts")
+
+
+def fetch_music_global(limit=10):
+    """
+    Apple's Daily Global Top 100, trimmed to the top `limit`.
+
+    Apple publishes no global storefront in the marketing RSS, so this scrapes
+    the chart page, which embeds its data in a <script id="serialized-server-
+    data"> blob. That is undocumented and can change without notice — when it
+    does, we fall back to Last.fm if a key is available, and otherwise the
+    section shows its empty-state note.
+    """
+    tracks = _scrape_apple_global(limit)
+    if tracks:
+        return tracks
+
+    if os.environ.get("LASTFM_API_KEY"):
+        print("  (Apple global chart unavailable — falling back to Last.fm)")
+        return _fetch_lastfm(limit)
+    return []
+
+
+def _scrape_apple_global(limit):
+    """Pull the chart out of Apple's embedded JSON. Best effort by design."""
+    try:
+        r = requests.get(
+            APPLE_GLOBAL_URL,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; daily-brief/1.0)"},
+            timeout=TIMEOUT,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}")
+
+        m = re.search(
+            r'<script[^>]+id="serialized-server-data"[^>]*>(.*?)</script>',
+            r.text, re.S)
+        if not m:
+            print("  ! apple global: no serialized-server-data block found "
+                  "(page structure changed)", file=sys.stderr)
+            return []
+
+        found = []
+        _walk_for_tracks(json.loads(m.group(1)), found, limit)
+        if not found:
+            print("  ! apple global: JSON found but no tracks recognised",
+                  file=sys.stderr)
+        return found[:limit]
+    except Exception as e:
+        print(f"  ! apple global failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return []
+
+
+def _walk_for_tracks(node, found, limit):
+    """
+    Recursively hunt for song entries rather than assuming a fixed path, since
+    the exact nesting is undocumented and has changed before.
+    """
+    if len(found) >= limit:
+        return
+    if isinstance(node, dict):
+        title = node.get("title") or node.get("name")
+        artist = node.get("subtitle") or node.get("artistName")
+        if (isinstance(title, str) and isinstance(artist, str)
+                and title.strip() and artist.strip()):
+            art = None
+            artwork = node.get("artwork")
+            if isinstance(artwork, dict):
+                template = artwork.get("template") or artwork.get("url")
+                if isinstance(template, str):
+                    art = (template.replace("{w}", "200").replace("{h}", "200")
+                           .replace("{f}", "jpg").replace("{c}", "bb"))
+            url = node.get("url") or ""
+            if url.startswith("/"):
+                url = "https://music.apple.com" + url
+            found.append({
+                "title": title.strip(), "summary": artist.strip(),
+                "url": url, "image": art,
+            })
+            return
+        for v in node.values():
+            _walk_for_tracks(v, found, limit)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_for_tracks(v, found, limit)
+
+
+def _fetch_lastfm(limit=10):
+    """
+    Worldwide top tracks from Last.fm — the fallback.
+
+    Caveat worth remembering when reading it: this counts scrobbles from
+    people who use Last.fm, which skews older and more rock/indie than global
+    streaming overall. It is genuinely worldwide, but it is not Billboard.
+    """
+    key = os.environ.get("LASTFM_API_KEY")
+    if not key:
+        return []
+
+    try:
+        r = requests.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                "method": "chart.gettoptracks",
+                "api_key": key,
+                "format": "json",
+                "limit": limit,
+            },
+            timeout=TIMEOUT,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+
+        payload = r.json()
+        if "error" in payload:
+            raise RuntimeError(f"Last.fm error {payload.get('error')}: "
+                               f"{payload.get('message')}")
+
+        out = []
+        for t in (payload.get("tracks", {}).get("track") or [])[:limit]:
+            # Last.fm's image array is usually placeholder art these days, so
+            # only take one if it looks real.
+            art = None
+            for img in reversed(t.get("image") or []):
+                url = (img.get("#text") or "").strip()
+                if url and "2a96cbd8b46e442fc41c2b86b821562f" not in url:
+                    art = url
+                    break
+            out.append({
+                "title": (t.get("name") or "").strip(),
+                "summary": ((t.get("artist") or {}).get("name") or "").strip(),
+                "url": t.get("url", ""),
+                "image": art,
+            })
+        return out
+    except Exception as e:
+        print(f"  ! lastfm fallback failed: {e}", file=sys.stderr)
         return []
 
 
@@ -740,9 +886,12 @@ h1{font-size:clamp(28px,4vw,40px);line-height:1.05;margin:0;
 .sec-emoji{font-size:16px}
 
 ol{list-style:none;margin:0;padding:0;counter-reset:n}
-li{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line)}
+/* Counting on the row, not on .rank — the lead story has no .rank element,
+   so counting there made it skip and the second item showed "1". */
+li{display:flex;gap:14px;padding:15px 0;border-top:1px solid var(--line);
+  counter-increment:n}
 li:first-child{border-top:none;padding-top:2px}
-.rank{counter-increment:n;font-size:12px;font-weight:700;color:var(--dim);
+.rank{font-size:12px;font-weight:700;color:var(--dim);
   min-width:15px;padding-top:2px;font-variant-numeric:tabular-nums}
 .rank::before{content:counter(n)}
 .body{flex:1;min-width:0}
@@ -1108,7 +1257,8 @@ def main():
 
     add("Superliga", fetch_superliga(), "matches")
     add("Football", fetch_football(), "matches")
-    add("Music", fetch_music(), "tracks")
+    add("Music · DK", fetch_music(country="dk", limit=10), "tracks")
+    add("Music · Global", fetch_music_global(limit=10), "tracks")
 
     power = fetch_power()
     print(f"  Power: {'ok' if power else 'unavailable'}")

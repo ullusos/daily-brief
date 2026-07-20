@@ -20,6 +20,7 @@ import re
 import sys
 import html
 import json
+import time
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -136,8 +137,8 @@ SECTION_STYLE = {
 # tell "nothing happened today" apart from "this is broken". Sections whose
 # API key is missing never get here; they stay hidden.
 EMPTY_STATE = {
-    "Superliga":   "No Superliga matches today",
-    "Football":    "No matches today",
+    "Superliga":   "No Superliga matches yesterday, today or tomorrow",
+    "Football":    "No matches yesterday, today or tomorrow",
     "Music · DK":     "Chart unavailable right now",
     "Music · Global": "Chart unavailable right now",
     "GitHub":      "Couldn't reach GitHub search",
@@ -175,6 +176,27 @@ def fetch_weather():
 
 
 # ------------------------------------------------------------------ feeds
+
+
+def get_with_retry(url, attempts=2, pause=3, **kw):
+    """
+    GET with one retry on a network hiccup.
+
+    Some of these hosts — Apple's marketing feed especially — occasionally
+    time out for no lasting reason. Losing a whole section to a single slow
+    response is a waste when waiting three seconds usually fixes it.
+    """
+    last = None
+    for n in range(1, attempts + 1):
+        try:
+            return requests.get(url, **kw)
+        except requests.RequestException as e:
+            last = e
+            if n < attempts:
+                print(f"  … retrying {url.split('/')[2]} after {type(e).__name__}",
+                      file=sys.stderr)
+                time.sleep(pause)
+    raise last
 
 
 def fetch_section(urls, limit):
@@ -403,9 +425,32 @@ def fetch_hackernews(limit=5):
         return []
 
 
-def fetch_football(limit=6):
+FOOTBALL_LIMIT = 8
+
+
+def _day_label(match_date, today):
+    """Which of our three days is this, if any?"""
+    if match_date == today:
+        return "today"
+    if match_date == today + dt.timedelta(days=1):
+        return "tomorrow"
+    if match_date == today - dt.timedelta(days=1):
+        return "yesterday"
+    return None
+
+
+def _order_matches(buckets, limit):
     """
-    Yesterday's results and today's fixtures from football-data.org.
+    Fixtures before results: what's still to come is the actionable part of a
+    morning brief, and yesterday's score keeps just as well further down.
+    """
+    return (buckets["today"] + buckets["tomorrow"] + buckets["yesterday"])[:limit]
+
+
+def fetch_football(limit=FOOTBALL_LIMIT):
+    """
+    Yesterday's results plus today's and tomorrow's fixtures from
+    football-data.org.
 
     The free tier covers 12 competitions — Premier League, La Liga, Bundesliga,
     Serie A, Ligue 1, Eredivisie, Primeira Liga, Championship, Brasileirão,
@@ -419,18 +464,20 @@ def fetch_football(limit=6):
         return None   # not configured — hide the section entirely
 
     today = dt.datetime.now(TZ).date()
-    yesterday = today - dt.timedelta(days=1)
     try:
-        r = requests.get(
+        r = get_with_retry(
             "https://api.football-data.org/v4/matches",
             headers={"X-Auth-Token": key},
-            params={"dateFrom": yesterday.isoformat(), "dateTo": today.isoformat()},
+            params={
+                "dateFrom": (today - dt.timedelta(days=1)).isoformat(),
+                "dateTo": (today + dt.timedelta(days=1)).isoformat(),
+            },
             timeout=TIMEOUT,
         )
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
 
-        played, upcoming = [], []
+        buckets = {"today": [], "tomorrow": [], "yesterday": []}
         for m in r.json().get("matches", []):
             home = m.get("homeTeam", {}).get("shortName") \
                 or m.get("homeTeam", {}).get("name", "?")
@@ -438,50 +485,57 @@ def fetch_football(limit=6):
                 or m.get("awayTeam", {}).get("name", "?")
             comp = m.get("competition", {}).get("name", "")
             status = m.get("status", "")
-            # The free tier exposes no per-match page, so these stay unlinked.
-            url = ""
+
+            local = None
+            try:
+                local = dt.datetime.fromisoformat(
+                    m.get("utcDate", "").replace("Z", "+00:00")).astimezone(TZ)
+            except Exception:
+                pass
+            day = _day_label(local.date(), today) if local else None
+            if not day:
+                continue
 
             if status == "FINISHED":
                 ft = m.get("score", {}).get("fullTime", {})
                 h, a = ft.get("home"), ft.get("away")
                 if h is None or a is None:
                     continue
-                played.append({
+                when = "full time" if day == "yesterday" else f"{day}, full time"
+                buckets[day].append({
                     "title": f"{home} {h}–{a} {away}",
-                    "summary": f"{comp} · full time",
-                    "url": url, "image": None,
+                    "summary": f"{comp} · {when}",
+                    # The free tier exposes no per-match page.
+                    "url": "", "image": None,
                 })
-            elif status in ("TIMED", "SCHEDULED"):
-                when = m.get("utcDate", "")
-                try:
-                    local = dt.datetime.fromisoformat(
-                        when.replace("Z", "+00:00")).astimezone(TZ)
-                    if local.date() != today:
-                        continue
-                    clock = f"{local:%H:%M}"
-                except Exception:
-                    clock = "today"
-                upcoming.append({
+            elif status in ("TIMED", "SCHEDULED", "IN_PLAY", "PAUSED"):
+                # No "playing now" label: the page is written once at 07:00 and
+                # read at any hour, so a live status would be stale within
+                # minutes. Kick-off time stays true whenever you read it.
+                if day == "today":
+                    when = f"kicks off {local:%H:%M}"
+                else:
+                    when = f"tomorrow {local:%H:%M}"
+                buckets[day].append({
                     "title": f"{home} v {away}",
-                    "summary": f"{comp} · kicks off {clock}",
-                    "url": url, "image": None,
+                    "summary": f"{comp} · {when}",
+                    "url": "", "image": None,
                 })
 
-        # Today's fixtures first — they're the actionable ones.
-        return (upcoming + played)[:limit]
+        return _order_matches(buckets, limit)
     except Exception as e:
         print(f"  ! football failed: {e}", file=sys.stderr)
         return []
 
 
-def fetch_superliga(limit=4):
+def fetch_superliga(limit=6):
     """
-    Danish Superliga fixtures and results via Sportmonks, whose free plan
+    Danish Superliga results and fixtures via Sportmonks, whose free plan
     covers exactly the Superliga and the Scottish Premiership.
 
-    Uses the fixture's own `name` and `result_info` strings rather than
-    unpicking the scores array, which is both simpler and less likely to break
-    if their response shape shifts.
+    Covers yesterday through tomorrow. Uses the fixture's own `name` and
+    `result_info` strings rather than unpicking the scores array — simpler,
+    and less likely to break if their response shape shifts.
 
     Skipped silently when SPORTMONKS_KEY isn't set.
     """
@@ -490,47 +544,54 @@ def fetch_superliga(limit=4):
         return None   # not configured — hide the section entirely
 
     today = dt.datetime.now(TZ).date()
-    yesterday = today - dt.timedelta(days=1)
     try:
-        r = requests.get(
+        r = get_with_retry(
             "https://api.sportmonks.com/v3/football/fixtures/between/"
-            f"{yesterday}/{today}",
+            f"{today - dt.timedelta(days=1)}/{today + dt.timedelta(days=1)}",
             params={"api_token": key},
             timeout=TIMEOUT,
         )
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
 
-        played, upcoming = [], []
+        buckets = {"today": [], "tomorrow": [], "yesterday": []}
         for fx in r.json().get("data", []) or []:
             name = (fx.get("name") or "").replace(" vs ", " v ").strip()
             if not name:
                 continue
-            result = (fx.get("result_info") or "").strip()
 
+            local = None
+            try:
+                # Sportmonks returns "YYYY-MM-DD HH:MM:SS" in UTC.
+                local = dt.datetime.strptime(
+                    fx.get("starting_at") or "", "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=dt.timezone.utc).astimezone(TZ)
+            except Exception:
+                pass
+            day = _day_label(local.date(), today) if local else None
+            if not day:
+                continue
+
+            result = (fx.get("result_info") or "").strip()
             if result:
-                played.append({
-                    "title": name, "summary": result, "url": "", "image": None,
+                when = result if day == "yesterday" else f"{day} · {result}"
+                buckets[day].append({
+                    "title": name, "summary": when, "url": "", "image": None,
                 })
                 continue
 
-            clock = ""
-            starts = fx.get("starting_at") or ""
-            try:
-                # Sportmonks returns "YYYY-MM-DD HH:MM:SS" in UTC.
-                stamp = dt.datetime.strptime(starts, "%Y-%m-%d %H:%M:%S")
-                local = stamp.replace(tzinfo=dt.timezone.utc).astimezone(TZ)
-                if local.date() != today:
-                    continue
-                clock = f"kicks off {local:%H:%M}"
-            except Exception:
-                clock = "today"
-            upcoming.append({
-                "title": name, "summary": f"Superliga · {clock}",
+            if day == "today":
+                when = f"kicks off {local:%H:%M}"
+            elif day == "tomorrow":
+                when = f"tomorrow {local:%H:%M}"
+            else:
+                when = "yesterday, no result yet"
+            buckets[day].append({
+                "title": name, "summary": f"Superliga · {when}",
                 "url": "", "image": None,
             })
 
-        return (upcoming + played)[:limit]
+        return _order_matches(buckets, limit)
     except Exception as e:
         print(f"  ! superliga failed: {e}", file=sys.stderr)
         return []
@@ -545,10 +606,10 @@ def fetch_music(limit=10, country="dk"):
     global storefront in this feed, so each call is one country.
     """
     try:
-        r = requests.get(
+        r = get_with_retry(
             f"https://rss.marketingtools.apple.com/api/v2/{country}/music/"
             f"most-played/{limit}/songs.json",
-            timeout=TIMEOUT,
+            timeout=40,
         )
         r.raise_for_status()
         out = []
@@ -1292,17 +1353,63 @@ def pages_url(repo):
     return f"https://{owner}.github.io/{name}/"
 
 
+def already_published_today(repo):
+    """
+    Has a brief already gone out today (Copenhagen date)?
+
+    This is what makes the schedule delay-proof. GitHub's cron is explicitly
+    best-effort — runs are routinely late by tens of minutes and sometimes
+    hours — so we can't ask "is it 07:00 right now?". We ask "has today's
+    brief happened yet?" instead, and let whichever run arrives first do the
+    work.
+    """
+    today = dt.datetime.now(TZ).date()
+    try:
+        issues = gh("GET", f"/repos/{repo}/issues"
+                           "?labels=brief&state=all&per_page=10")
+        for issue in issues:
+            stamp = issue.get("created_at", "")
+            if not stamp:
+                continue
+            created = dt.datetime.fromisoformat(
+                stamp.replace("Z", "+00:00")).astimezone(TZ).date()
+            if created == today:
+                print(f"  today's brief is already out: #{issue['number']}")
+                return True
+        return False
+    except Exception as e:
+        # If we can't tell, publishing a duplicate beats publishing nothing.
+        print(f"  ! couldn't check for today's brief ({e}) — carrying on",
+              file=sys.stderr)
+        return False
+
+
 # ------------------------------------------------------------------- main
 
 
 def main():
     now = dt.datetime.now(TZ)
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    forced = os.environ.get("FORCE_RUN") == "1"
 
-    # GitHub cron is UTC and ignores daylight saving, so the workflow fires at
-    # two UTC times and we keep only the one that is 07:00 in Copenhagen.
-    if os.environ.get("FORCE_RUN") != "1" and now.hour != SEND_HOUR:
-        print(f"Local time is {now:%H:%M} in {CITY}, not 0{SEND_HOUR}:00 — skipping.")
-        return
+    # Two conditions instead of an exact-time check:
+    #
+    #   1. it is at or after SEND_HOUR locally — handles daylight saving,
+    #      since the workflow fires at two UTC times and only one of them is
+    #      morning in Copenhagen;
+    #   2. today's brief hasn't gone out yet — handles GitHub's scheduler,
+    #      which is best-effort and often runs late, sometimes by hours.
+    #
+    # Checking the clock exactly, as this used to, meant a delayed run was
+    # silently thrown away and no brief appeared at all.
+    if not forced:
+        if now.hour < SEND_HOUR:
+            print(f"Local time is {now:%H:%M} in {CITY}, before "
+                  f"{SEND_HOUR:02d}:00 — too early, skipping.")
+            return
+        if repo and already_published_today(repo):
+            print("Nothing to do.")
+            return
 
     print(f"Building brief for {now:%Y-%m-%d %H:%M %Z}")
 
@@ -1350,7 +1457,6 @@ def main():
     if not weather and not power and not any(sections.values()):
         sys.exit("Every source failed — publishing nothing. Check the log above.")
 
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
     url = pages_url(repo) if repo else ""
 
     os.makedirs("docs", exist_ok=True)

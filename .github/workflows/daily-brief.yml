@@ -2,11 +2,16 @@ name: Daily Brief
 
 on:
   schedule:
-    # GitHub cron runs on UTC and does not follow daylight saving, so we fire
-    # at both candidate times. brief.py checks the real Copenhagen clock and
-    # exits immediately unless it is 07:00 there — so exactly one run publishes.
-    - cron: "0 5 * * *"   # 07:00 Copenhagen, summer (CEST)
-    - cron: "0 6 * * *"   # 07:00 Copenhagen, winter (CET)
+    # Deliberately NOT on the hour. GitHub's scheduler is best-effort and the
+    # top of every hour is its busiest moment — runs there are routinely
+    # delayed by 30-60+ minutes. An odd minute gets picked up sooner.
+    #
+    # Two times because cron is UTC and ignores daylight saving. brief.py
+    # publishes on the first run that is (a) at or after 07:00 in Copenhagen
+    # and (b) finds today's brief hasn't gone out yet — so exactly one of
+    # these publishes, however late GitHub actually gets around to it.
+    - cron: "23 5 * * *"   # 07:23 Copenhagen, summer (CEST)
+    - cron: "23 6 * * *"   # 07:23 Copenhagen, winter (CET)
   workflow_dispatch:      # lets you trigger a run by hand from the Actions tab
     inputs:
       force:
